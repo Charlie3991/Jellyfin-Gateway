@@ -1,0 +1,302 @@
+================================================================================
+ JELLYFIN GATEWAY - TAILSCALE + NORDVPN ACCESS
+ Setup instructions + how it works + troubleshooting
+================================================================================
+ Machine : <your-machine> (Linux, user "<your-user>")
+ Tailnet : <your-tailnet>
+ Node IP : <node-tailnet-ip> (from `tailscale ip -4`;
+                MagicDNS: <machine>.<your-tailnet>.ts.net)
+ Gateway : http://<node-tailnet-ip>:8390 (works from any device on the tailnet,
+                                         incl. mobile data - no port forwarding)
+ Written : 2026-09-07 - documents a configuration that works end to end;
+           substitute the <placeholders> with your own values.
+
+--------------------------------------------------------------------------------
+ 1. WHAT THIS GETS YOU
+--------------------------------------------------------------------------------
+ - The gateway (port 8390) reachable from anywhere via Tailscale: phone,
+   laptop, a friend's machine - on Wi-Fi, mobile data, any network.
+ - Tailscale keeps working WHILE NordVPN is connected, so torrents keep
+   going through the NordLynx tunnel. Without pieces 4+5 below, NordVPN
+   kills Tailscale (its own firewall + routing swallow Tailscale's traffic).
+
+--------------------------------------------------------------------------------
+ 2. THE FIVE PIECES (and why each one exists)
+--------------------------------------------------------------------------------
+ P1  Tailscale installed and logged in.
+     tailscaled (root, systemd) creates interface tailscale0 (100.x.y.z).
+ P2  Gateway bound to 0.0.0.0:8390 (GATEWAY_HOST=0.0.0.0 in .env), so it
+     listens on tailscale0 as well as the LAN.
+ P3  ufw INPUT rules for tailscale0.
+     Persistent rule: tcp/8390 on tailscale0 (in /etc/ufw/user.rules).
+     Plus an ad-hoc chain "ts-input" (added earlier with raw nft/iptables,
+     NOT in ufw's files - see section 8) that accepts ALL tailscale0 input.
+ P4  NordVPN allowlist includes the tailnet range 100.64.0.0/10.
+     NordVPN's firewall (nft table "inet nordvpn") has its own input AND
+     output chains with policy DROP. The output chain accepts "local to
+     allowlist IPs" - without 100.64.0.0/10 in the set, every reply packet
+     headed for a tailnet peer (SYN-ACK etc.) hits the policy DROP and
+     connections time out. THIS was the real blocker for the friend.
+ P5  tailscale-vpn-bypass: nft table "ip tailscale_bypass" (output hook,
+     priority mangle) that stamps tailscale traffic with NordVPN's bypass
+     mark 0xe1f1:
+       rule A: tailscaled's own egress (matched by its cgroup)
+       rule B: anything destined for 100.64.0.0/10
+     0xe1f1 is NordVPN's "Firewall Mark" (its ip rule "32765: not from all
+     fwmark 0xe1f1 lookup 205" excludes marked packets from the tunnel).
+     Re-applied at boot by the systemd unit tailscale-vpn-bypass.service.
+
+ P4 and P5 are belt-and-suspenders: which output chain fires first depends
+ on registration order, and a NordVPN reconnect can flip it. Each piece is
+ sufficient on its own in a different chain order; keep BOTH.
+
+--------------------------------------------------------------------------------
+ 3. HOW A PACKET MOVES (so you can reason about failures)
+--------------------------------------------------------------------------------
+ INBOUND from a tailnet client (their SYN to :8390):
+   tailscale0 -> ufw INPUT chain -> ts-input (iifname "tailscale0" accept)
+                -> local delivery -> gateway
+   (ufw's per-port tailscale0 rule is shadowed by ts-input's terminal
+   accept while ts-input exists - that is why that rule's counter stays 0)
+
+ OUTBOUND reply (SYN-ACK, daddr = tailnet IP, oif = tailscale0):
+   routing: ip rule 5270 (lookup 52, Tailscale peer routes) -> oif tailscale0
+   output hook chains (priority mangle), first terminal verdict wins:
+     nordvpn output:
+       daddr in @allowlist_subnets  -> mark 0xe1f1 + ACCEPT   [P4, output side]
+       oifname "nordlynx"           -> ACCEPT (goes in the tunnel)
+       everything else              -> POLICY DROP   <-- friend's timeout
+     tailscale_bypass output:
+       marks tailscaled-cgroup + tailnet-dest packets with 0xe1f1  [P5]
+   accepted packets enter the TUN; tailscaled sends them direct or via a
+   DERP relay.
+
+ tailscaled's OWN egress (control server, DERP relays):
+   daddr = real internet addresses. Marked 0xe1f1 by P5 (cgroup rule) it
+   bypasses table 205 (direct internet); unmarked it rides the NordLynx
+   tunnel. Direct is more robust - double-tunnelled UDP is what caused the
+   "netcheck: UDP is blocked / node offline" state before P5.
+
+ PING vs TCP asymmetry (why "ping works but ports time out"):
+   tailscale ping rides tailscaled's own sockets (direct or DERP-relayed);
+   the DERP relay path is ordinary internet-bound traffic that the tunnel
+   happily carries. Your app's TCP replies, however, are raw kernel packets
+   with daddr = tailnet IP - those are the ones the nordvpn OUTPUT chain
+   drops until P4/P5 cover them.
+
+--------------------------------------------------------------------------------
+ 4. SETUP STEPS (from scratch)
+--------------------------------------------------------------------------------
+ STEP 1 - Tailscale
+   sudo pacman -S tailscale
+   sudo systemctl enable --now tailscaled
+   tailscale up          # opens a URL; log in with the tailnet account
+
+ STEP 2 - Gateway (already done on this machine)
+   Project: $HOME/Documents/Jellyfin-Gateway
+   .env:    GATEWAY_HOST=0.0.0.0, GATEWAY_PORT=8390
+   systemd user unit: jellyfin-gateway.service (enabled)
+   verify:  systemctl --user status jellyfin-gateway
+            curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8390/
+
+ STEP 3 - ufw input rule for the tailnet (persistent)
+   sudo ufw allow in on tailscale0 to any port 8390 proto tcp
+   (adds both IPv4 and IPv6 rules; survives reboot via /etc/ufw/user.rules)
+
+ STEP 4 - NordVPN allowlist for the tailnet (persistent, client-managed)
+   nordvpn allowlist add subnet 100.64.0.0/10
+   (100.64.0.0/10 = the entire Tailscale IP space. Add your LAN subnet the same way, e.g. for phone-on-WiFi access.)
+   verify: sudo nft list set inet nordvpn allowlist_subnets
+           -> elements must include 100.64.0.0/10
+
+ STEP 5 - NordVPN bypass for Tailscale (persistent, systemd oneshot at boot)
+   Sources:  $HOME/bin/tailscale-vpn-bypass.sh
+             $HOME/bin/tailscale-vpn-bypass.service
+   Install (as root):
+   sudo install -m 0755 $HOME/bin/tailscale-vpn-bypass.sh /usr/local/sbin/
+   sudo install -m 0644 $HOME/bin/tailscale-vpn-bypass.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now tailscale-vpn-bypass
+   verify: journalctl -u tailscale-vpn-bypass -n 6
+           -> must show:  ok: tailscaled cgroup mark
+                          ok: tailnet-dest mark
+   What the script does (full script in section 9): nft table
+   "ip tailscale_bypass", chain output (type filter hook output priority
+   mangle), two rules:
+     socket cgroupv2 level 2 "system.slice/tailscaled.service" meta mark set 0xe1f1
+     ip daddr 100.64.0.0/10 meta mark set 0xe1f1
+   NOTE (cost an evening): the cgroupv2 value must be a path that EXISTS
+   under /sys/fs/cgroup - use "system.slice/tailscaled.service", NOT just
+   "tailscaled.service" (nft stat()s the path; a bare component fails with
+   "Could not parse cgroupsv2 path"). Also use the bare value, no "==".
+
+ CLIENT SIDE (phone / laptop / friend's device)
+   Install Tailscale, join tailnet <your-tailnet>, then open:
+     http://<node-tailnet-ip>:8390
+   (The MagicDNS name <machine>.<your-tailnet>.ts.net works inside the
+   Tailscale app; if it does not resolve on the PC itself, use the IP there.)
+
+--------------------------------------------------------------------------------
+ 5. VERIFICATION CHECKLIST (whole stack)
+--------------------------------------------------------------------------------
+   tailscale status                          -> this node line says "online"
+   journalctl -u tailscale-vpn-bypass -n 6   -> both "ok" lines
+   sudo nft list set inet nordvpn allowlist_subnets
+                                             -> includes 100.64.0.0/10
+   curl -sS -o /dev/null -w '%{http_code}\n' http://<node-tailnet-ip>:8390/
+                                             -> 200 (from the PC itself)
+   from a tailnet client (the real test):
+     tailscale ping <node-tailnet-ip>          -> pong (direct or via DERP)
+     curl -v -m 15 http://<node-tailnet-ip>:8390/  -> HTTP 200
+   systemd:
+   systemctl status tailscaled
+   systemctl status tailscale-vpn-bypass
+   systemctl --user status jellyfin-gateway qbittorrent-vpn-guard
+   NordVPN still connected (torrents stay in the tunnel):
+     nordvpn status   /  ip a | grep nordlynx
+
+--------------------------------------------------------------------------------
+ 6. TROUBLESHOOTING
+--------------------------------------------------------------------------------
+ T1. Node offline with VPN on; tailscale log says "netcheck: UDP is
+     blocked" / no DERP connection.
+     Cause: tailscaled's egress is entangled in the double tunnel.
+     Fix:   journalctl -u tailscale-vpn-bypass -n 6   (both "ok"?)
+            sudo nft list table ip tailscale_bypass
+            sudo systemctl restart tailscale-vpn-bypass
+            (if the cgroup rule failed: see T4)
+
+ T2. tailscale ping to the box works, but a TCP port (e.g. 8390) times out
+     from a tailnet client.
+     Cause: outbound REPLY packets to the tailnet are dropped by NordVPN's
+            OUTPUT chain (daddr not in allowlist, oif tailscale0 is not
+            nordlynx -> policy drop). Inbound was fine all along.
+     Fix:   nordvpn allowlist add subnet 100.64.0.0/10
+            verify: sudo nft list set inet nordvpn allowlist_subnets
+            client retests. (This is the fix that resolved a client timeout.)
+
+ T3. After a reboot: gateway still works but other tailnet ports are closed.
+     Cause: the ad-hoc ts-input chain is gone (it was added with raw
+            nft/iptables, not via ufw, so ufw's table rebuild drops it).
+     Effect: only the persistent ufw rules apply on tailscale0 (tcp/8390) -
+            usually exactly what you want. No action needed unless you
+            actually need more ports open; add them with:
+            sudo ufw allow in on tailscale0 to any port <N> proto tcp
+
+ T4. "Could not parse cgroupsv2 path" when the bypass script runs.
+     Cause: cgroupv2 match value is not an existing path under /sys/fs/cgroup.
+     Fix:   use the full relative path "system.slice/tailscaled.service"
+            (tailscaled runs as root here, so no user-specific cgroup).
+            Confirm: ls /sys/fs/cgroup/system.slice/tailscaled.service
+
+ T5. Anything else odd: get the full picture in one shot.
+            sudo nft list ruleset > /tmp/nft-ruleset.txt
+     Then look at every chain hooked to the same netfilter hook in the dump
+     (for input: "ip filter", "ip6 filter", "inet nordvpn"; for output:
+     "inet nordvpn", "ip tailscale_bypass", "ip filter", "ip mangle").
+     The FIRST chain that can reach a terminal verdict wins; a 0-packet
+     counter on a rule that "should" match means the drop happened in an
+     earlier chain.
+
+--------------------------------------------------------------------------------
+ 7. SECURITY NOTES
+--------------------------------------------------------------------------------
+ - Tailscale is the trust boundary: only tailnet members can address
+   tailscale0 at all.
+ - While ts-input exists, tailnet members can reach ANY listening port on
+   this box (ts-input accepts all tailscale0 input before ufw's per-port
+   rules run) - e.g. Jellyfin :8096 and the qBittorrent WebUI :8090 are
+   also reachable on the tailnet. Probably fine/desirable (Jellyfin from
+   the phone!), but if you want ONLY 8390, remove ts-input properly:
+     sudo nft delete rule ip filter INPUT 0      # the "jump ts-input" rule FIRST
+     sudo nft delete chain ip filter ts-input
+   (deleting the chain before its jump makes INPUT fail for every packet!)
+ - The gateway requires a Jellyfin login. Ordinary users can view status and
+   add torrents; only Jellyfin administrators can control the VPN, sorting,
+   settings, library refresh, or server folder browser.
+ - ufw is the effective INPUT firewall while enabled (it terminates every
+   input packet before NordVPN's input chain). NordVPN's input allowlist
+   is the backup gate (it matters if ufw is ever stopped) - keep
+   100.64.0.0/10 and your LAN subnet in it.
+
+--------------------------------------------------------------------------------
+ 8. PERSISTENCE - WHAT SURVIVES A REBOOT
+--------------------------------------------------------------------------------
+   tailscaled ............. systemd, enabled .................. persistent
+   jellyfin-gateway ....... systemd USER unit (needs login) ... persistent
+   qbittorrent-vpn-guard .. systemd USER unit .................. persistent
+   tailscale-vpn-bypass ... systemd oneshot at boot ............ persistent
+                            (the nft table itself is kernel-only; the unit
+                             recreates it at boot - correct design)
+   ufw tailscale0/8390 .... /etc/ufw/user.rules ................ persistent
+   ufw LAN/8390 ........... /etc/ufw/user.rules ................ persistent
+   nordvpn allowlist ...... client-managed ..................... persistent
+   ts-input chain ......... AD-HOC, NOT in ufw files ........... GONE after
+                            ufw restart/reboot (see T3 - usually fine)
+
+--------------------------------------------------------------------------------
+ 9. QUICK REFERENCE / EXACT ARTIFACTS
+--------------------------------------------------------------------------------
+ Addresses
+   gateway (tailnet):   http://<node-tailnet-ip>:8390
+   gateway (LAN):       http://<pc-lan-ip>:8390
+   Jellyfin (LAN):      http://<pc-lan-ip>:8096
+   qBittorrent WebUI:   http://127.0.0.1:8090      (user: admin)
+   tailscale:           <node-tailnet-ip>/32   (v6 <node-v6>)
+   tailnet:             <your-tailnet>
+   LAN:                 PC <pc-lan-ip>, phone <phone-lan-ip>,
+                        router <router-lan-ip>
+   NordVPN:             NordLynx tunnel iface "nordlynx", routing table 205,
+                        bypass fwmark 0xe1f1 (its ip rule 32765 excludes
+                        marked packets from the tunnel)
+
+ Files
+   $HOME/Documents/Jellyfin-Gateway/              project + .env
+   $HOME/bin/tailscale-vpn-bypass.sh                  bypass script (source)
+   $HOME/bin/tailscale-vpn-bypass.service             unit (source)
+   /usr/local/sbin/tailscale-vpn-bypass.sh            installed script
+   /etc/systemd/system/tailscale-vpn-bypass.service   installed unit (enabled)
+   ~/.config/systemd/user/jellyfin-gateway.service    gateway user unit
+   ~/.config/systemd/user/qbittorrent-vpn-guard.service  standalone VPN guard
+   /etc/ufw/user.rules                                ufw persistent rules
+   $HOME/.local/state/ts-bypass-note.json         state notes (this setup)
+
+ Full bypass script (/usr/local/sbin/tailscale-vpn-bypass.sh):
+   #!/bin/sh
+   # Mark Tailscale traffic with NordVPN's bypass fwmark (0xe1f1) so it is
+   # excluded from routing table 205 (the NordLynx catch-all) and uses the
+   # main table instead - i.e. direct internet, no tunnel.
+   # Rule 1: tailscaled's own egress (control + DERP), matched by cgroup.
+   # Rule 2: any local traffic destined for the tailnet (100.64.0.0/10).
+   # Idempotent: replaces the table on every run.
+   nft delete table ip tailscale_bypass 2>/dev/null
+   nft add table ip tailscale_bypass || exit 1
+   nft add chain ip tailscale_bypass output '{ type filter hook output priority mangle; }' || exit 1
+   nft add rule ip tailscale_bypass output \
+       'socket cgroupv2 level 2 "system.slice/tailscaled.service" meta mark set 0xe1f1' \
+       && echo "ok: tailscaled cgroup mark" || echo "WARN: cgroup mark rule failed"
+   nft add rule ip tailscale_bypass output \
+       'ip daddr 100.64.0.0/10 meta mark set 0xe1f1' \
+       && echo "ok: tailnet-dest mark" || echo "WARN: tailnet-dest mark rule failed"
+
+ Full unit (/etc/systemd/system/tailscale-vpn-bypass.service):
+   [Unit]
+   Description=Route Tailscale traffic around the NordVPN tunnel (fwmark 0xe1f1 bypass)
+   After=network-pre.target
+   Wants=network-pre.target
+   [Service]
+   Type=oneshot
+   RemainAfterExit=yes
+   ExecStart=/usr/local/sbin/tailscale-vpn-bypass.sh
+   [Install]
+   WantedBy=multi-user.target
+
+ TAILSCALE-RECOVERY ONE-LINERS (if the VPN/Tailscale state gets wedged):
+   sudo systemctl restart tailscale-vpn-bypass
+   sudo systemctl restart tailscaled
+   nordvpn allowlist add subnet 100.64.0.0/10     # re-add if ever removed
+
+ SHELL NOTE: this box runs fish. Paste long multi-line commands one line at
+ a time - pasted blocks can get split into separate commands and fail with
+ "Too few arguments" / "Unknown command".
+================================================================================

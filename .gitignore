@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# secrets & local config - never commit
+.env
+.env.*
+*.env
+
+# explicitly keep sanitized examples
+!.env.example
+!*.env.example
+
+# runtime state (auto-created; holds local paths + sort history)
+data/*
+!data/.gitkeep
+
+# media content (personal downloads - never commit)
+media/downloads/*
+media/Movies/*
+media/TV/*
+!media/downloads/.gitkeep
+!media/Movies/.gitkeep
+!media/TV/.gitkeep
+
+# logs & OS cruft
+*.log
+.DS_Store
+
+# Development tests are kept in the private repository
+tests/

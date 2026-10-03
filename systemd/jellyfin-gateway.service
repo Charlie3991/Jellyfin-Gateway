@@ -1,0 +1,38 @@
+[Unit]
+Description=Jellyfin Gateway (dashboard + auto-sort)
+# qBittorrent can run as a service (qbittorrent-nox) or as the desktop GUI
+# app; the gateway reconnects automatically once its WebUI (:8090) is up.
+After=network-online.target
+
+[Service]
+# Adjust the project path if you cloned it somewhere other than ~/Documents:
+# systemd user units support %h = your home directory.
+WorkingDirectory=%h/Documents/Jellyfin-Gateway
+EnvironmentFile=%h/Documents/Jellyfin-Gateway/.env
+ExecStart=%h/Documents/Jellyfin-Gateway/.venv/bin/python gateway.py
+Restart=on-failure
+RestartSec=3
+
+# Defense in depth (ISSUE 5). Deliberately NO ProtectSystem/ProtectHome,
+# SystemCallFilter or MemoryDenyWriteExecute: the sorter's media and
+# download dirs are user-configurable and can live anywhere, and the
+# child CLIs (ip, tailscale, nordvpn) make an aggressive seccomp
+# allowlist fragile across upgrades.  Path confinement is available as
+# an optional drop-in — see README.md ("systemd hardening").
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# AF_NETLINK is required by the `ip` child process; AF_UNIX by the
+# D-Bus-using tailscale/nordvpn CLIs.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectClock=yes
+ProtectHostname=yes
+SystemCallArchitectures=native
+# 0027: private from other users, still group-shareable for media trees.
+UMask=0027
+
+[Install]
+WantedBy=default.target

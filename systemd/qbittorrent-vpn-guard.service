@@ -1,0 +1,31 @@
+[Unit]
+Description=qBittorrent VPN guard (pause all torrents when the VPN tunnel drops)
+After=network-online.target
+
+[Service]
+Type=simple
+# Create this file (0600) with the guard's env vars, e.g. from
+# qb-vpn-guard.env.example. At minimum QB_PASS must be set.
+EnvironmentFile=%h/.config/qb-vpn-guard.env
+ExecStart=/usr/bin/python3 %h/Documents/Jellyfin-Gateway/vpn_guard.py
+Restart=on-failure
+RestartSec=5
+
+# Defense in depth (ISSUE 5). Same conservative set as the gateway unit;
+# no filesystem confinement (the guard's filesystem exposure is already
+# minimal).  AF_NETLINK is required by the `ip` child process.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectClock=yes
+ProtectHostname=yes
+SystemCallArchitectures=native
+# 0077: the guard only writes its own internal state — owner-only.
+UMask=0077
+
+[Install]
+WantedBy=default.target
