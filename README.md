@@ -353,10 +353,10 @@ controls which peers the gateway trusts to forward the real client address.
 
 ## Tailscale + NordVPN together
 
-`TAILSCALE-SETUP.txt` documents the full recipe for reaching the dashboard
-over Tailscale **while** NordVPN is connected (allowlist the tailnet range,
-bypass fwmark so tailscaled's own traffic stays direct), plus a
-troubleshooting guide.
+`TAILSCALE-SETUP.txt` covers Tailscale installation across Linux distributions,
+gateway access, UFW and firewalld options, and troubleshooting when NordVPN
+is also connected. Advanced VPN bypass settings depend on the host's actual
+routing and firewall configuration.
 
 ## License
 
